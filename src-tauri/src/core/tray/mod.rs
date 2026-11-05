@@ -1,5 +1,6 @@
 use crate::config::{IProfilePreview, IVerge};
 use crate::core::lightweight;
+use crate::core::proxy_view::{ProxyMemberRef, ProxyViewBuilder, ProxyViewInput, ProxyViewV1};
 use crate::core::tray::menu_def::TrayAction;
 use crate::process::AsyncHandler;
 use crate::singleton;
@@ -14,7 +15,6 @@ use crate::{
 use clash_verge_limiter::{Limiter, SystemClock, SystemLimiter};
 use clash_verge_logging::logging_error;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri_plugin_mihomo::models::Proxies;
 use tokio::fs;
 
 use super::handle;
@@ -456,96 +456,79 @@ fn create_profile_menu_item(
         .collect()
 }
 
-fn create_subcreate_proxy_menu_item(
-    app_handle: &AppHandle,
-    proxy_mode: &str,
-    proxy_group_order_map: Option<HashMap<String, usize>>,
-    proxy_nodes_data: Option<Proxies>,
-) -> Vec<Submenu<Wry>> {
-    let proxy_submenus: Vec<Submenu<Wry>> = {
-        let mut submenus: Vec<(String, usize, Submenu<Wry>)> = Vec::new();
+fn tray_member_delay<'a>(
+    member: &'a ProxyMemberRef,
+    view: &ProxyViewV1,
+    group_delays: &HashMap<&str, u16>,
+) -> (&'a str, Option<u16>) {
+    match member {
+        ProxyMemberRef::Group { name } => (name, group_delays.get(name.as_str()).copied()),
+        ProxyMemberRef::Node { name, record_id } => {
+            let delay = view
+                .records
+                .get(record_id)
+                .and_then(|node| node.history.last())
+                .map(|history| history.delay);
+            (name, delay)
+        }
+        ProxyMemberRef::Unresolved { name, .. } => (name, None),
+    }
+}
 
-        // TODO: 应用启动时，内核还未启动完全，无法获取代理节点信息
-        if let Some(proxy_nodes_data) = proxy_nodes_data {
-            for (group_name, group_data) in proxy_nodes_data.proxies.iter() {
-                let should_show = match proxy_mode {
-                    "global" => group_name == "GLOBAL",
-                    _ => group_name != "GLOBAL",
-                } && !group_data.hidden.unwrap_or_default();
+fn create_proxy_submenus(app_handle: &AppHandle, proxy_mode: &str, view: &ProxyViewV1) -> Vec<Submenu<Wry>> {
+    let groups = view.groups.iter().chain(view.global.iter());
+    let group_delays = groups
+        .clone()
+        .filter_map(|group| Some((group.name.as_str(), group.history.last()?.delay)))
+        .collect::<HashMap<_, _>>();
 
-                if !should_show {
-                    continue;
-                }
+    groups
+        .filter(|group| (proxy_mode == "global") == (group.name == "GLOBAL") && !group.hidden.unwrap_or_default())
+        .filter_map(|group| {
+            let group_name = &group.name;
+            let now_proxy = group.now.as_deref().unwrap_or_default();
+            let group_items: Vec<_> = group
+                .members
+                .iter()
+                .filter_map(|member| {
+                    let (name, delay) = tray_member_delay(member, view, &group_delays);
+                    let delay_text = match delay {
+                        Some(delay @ 1..=9999) => format!("{delay}ms"),
+                        _ => "-ms".to_owned(),
+                    };
+                    let item_id = format!("proxy_{group_name}_{name}");
+                    let display_text = format!("{name}   | {delay_text}");
 
-                let Some(all_proxies) = group_data.all.as_ref() else {
-                    continue;
-                };
+                    CheckMenuItem::with_id(app_handle, item_id, display_text, true, name == now_proxy, None::<&str>)
+                        .map_err(|e| logging!(warn, Type::Tray, "Failed to create proxy menu item: {}", e))
+                        .ok()
+                })
+                .collect();
 
-                let now_proxy = group_data.now.as_deref().unwrap_or_default();
-
-                let group_items: Vec<CheckMenuItem<Wry>> = all_proxies
-                    .iter()
-                    .filter_map(|proxy_str| {
-                        let is_selected = *proxy_str == now_proxy;
-                        let item_id = format!("proxy_{}_{}", group_name, proxy_str);
-
-                        let delay_text = proxy_nodes_data
-                            .proxies
-                            .get(proxy_str)
-                            .and_then(|h| h.history.last())
-                            .map(|h| match h.delay {
-                                0 => "-ms".into(),
-                                delay if delay >= 10000 => "-ms".into(),
-                                _ => format!("{}ms", h.delay),
-                            })
-                            .unwrap_or_else(|| "-ms".into());
-
-                        let display_text = format!("{}   | {}", proxy_str, delay_text);
-
-                        CheckMenuItem::with_id(app_handle, item_id, display_text, true, is_selected, None::<&str>)
-                            .map_err(|e| logging!(warn, Type::Tray, "Failed to create proxy menu item: {}", e))
-                            .ok()
-                    })
-                    .collect();
-
-                if group_items.is_empty() {
-                    continue;
-                }
-
-                let group_display_name = group_name.to_string();
-
-                let group_items_refs: Vec<&dyn IsMenuItem<Wry>> =
-                    group_items.iter().map(|item| item as &dyn IsMenuItem<Wry>).collect();
-
-                if let Ok(submenu) = Submenu::with_id_and_items(
-                    app_handle,
-                    format!("proxy_group_{}", group_name),
-                    group_display_name,
-                    true,
-                    &group_items_refs,
-                ) {
-                    let insertion_index = submenus.len();
-                    submenus.push((group_name.into(), insertion_index, submenu));
-                } else {
-                    logging!(warn, Type::Tray, "Failed to create proxy group submenu: {}", group_name);
-                }
+            if group_items.is_empty() {
+                return None;
             }
-        }
 
-        if let Some(order_map) = proxy_group_order_map.as_ref() {
-            submenus.sort_by(|(name_a, original_index_a, _), (name_b, original_index_b, _)| {
-                match (order_map.get(name_a), order_map.get(name_b)) {
-                    (Some(index_a), Some(index_b)) => index_a.cmp(index_b),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => original_index_a.cmp(original_index_b),
-                }
-            });
-        }
+            let group_items_refs: Vec<&dyn IsMenuItem<Wry>> =
+                group_items.iter().map(|item| item as &dyn IsMenuItem<Wry>).collect();
 
-        submenus.into_iter().map(|(_, _, submenu)| submenu).collect()
-    };
-    proxy_submenus
+            Submenu::with_id_and_items(
+                app_handle,
+                format!("proxy_group_{group_name}"),
+                group_name,
+                true,
+                &group_items_refs,
+            )
+            .map_err(|e| {
+                logging!(
+                    warn,
+                    Type::Tray,
+                    "Failed to create proxy group submenu {group_name}: {e}"
+                )
+            })
+            .ok()
+        })
+        .collect()
 }
 
 fn create_proxy_menu_item(
@@ -599,33 +582,22 @@ async fn create_tray_menu(
     let fetch_proxy_groups =
         options.include_proxy_groups && verge_settings.tray_proxy_groups_display_mode.as_deref() != Some("disable");
 
-    // TODO: should update tray menu again when it was timeout error
-    let (proxy_nodes_data, runtime_proxy_groups_order) = if fetch_proxy_groups {
-        let proxy_nodes_data =
-            tokio::time::timeout(Duration::from_millis(1000), handle::Handle::mihomo().get_proxies())
-                .await
-                .map_or(None, |res| res.ok());
-
+    let proxy_view = if fetch_proxy_groups {
+        let mihomo = handle::Handle::mihomo();
+        let timeout = Duration::from_millis(1000);
+        let (proxies, providers) = tokio::join!(
+            tokio::time::timeout(timeout, mihomo.get_proxies()),
+            tokio::time::timeout(timeout, mihomo.get_proxy_providers()),
+        );
         let runtime = Config::runtime().await.latest_arc();
-        let runtime_proxy_groups_order = runtime.config.as_ref().map(|config| {
-            config
-                .get("proxy-groups")
-                .and_then(|groups| groups.as_sequence())
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .filter_map(|group| group.get("name"))
-                        .filter_map(|name| name.as_str())
-                        .enumerate()
-                        .map(|(index, name)| (name.into(), index))
-                        .collect::<HashMap<String, usize>>()
-                })
-                .unwrap_or_default()
-        });
-
-        (proxy_nodes_data, runtime_proxy_groups_order)
+        proxies.ok().and_then(Result::ok).map(|proxies| {
+            let providers = providers.ok().and_then(Result::ok);
+            let mut input = ProxyViewInput::from_runtime_config(runtime.config.as_ref(), proxies, providers);
+            input.runtime_group_order.extend(input.proxies.proxies.keys().cloned());
+            ProxyViewBuilder::build(input)
+        })
     } else {
-        (None, None)
+        None
     };
 
     if fetch_proxy_groups {
@@ -637,8 +609,6 @@ async fn create_tray_menu(
         .as_deref()
         .unwrap_or("default");
     let include_proxy_groups = options.include_proxy_groups && tray_proxy_groups_display_mode != "disable";
-
-    let proxy_group_order_map = runtime_proxy_groups_order;
 
     let show_outbound_modes_inline = verge_settings.tray_inline_outbound_modes.unwrap_or(false);
 
@@ -720,8 +690,10 @@ async fn create_tray_menu(
     )?;
 
     let (proxies_menu, inline_proxy_items) = if include_proxy_groups {
-        let proxy_sub_menus =
-            create_subcreate_proxy_menu_item(app_handle, current_proxy_mode, proxy_group_order_map, proxy_nodes_data);
+        let proxy_sub_menus = proxy_view
+            .as_ref()
+            .map(|view| create_proxy_submenus(app_handle, current_proxy_mode, view))
+            .unwrap_or_default();
 
         match tray_proxy_groups_display_mode {
             "default" => create_proxy_menu_item(app_handle, false, proxy_sub_menus, &texts.proxies)?,
@@ -1006,4 +978,56 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tray_uses_the_delay_from_the_groups_provider() -> anyhow::Result<()> {
+        let proxies = serde_json::from_value(json!({
+            "proxies": {
+                "Local": {"history": [{"delay": 23}]},
+                "Group A": {"all": ["Local", "Shared", "Missing"]},
+                "Group B": {"all": ["Shared"]}
+            }
+        }))?;
+        let providers = serde_json::from_value(json!({
+            "providers": {
+                "A": {"vehicleType": "HTTP", "proxies": [{"name": "Shared", "history": [{"delay": 81}]}]},
+                "B": {"vehicleType": "File", "proxies": [{"name": "Shared", "history": [{"delay": 137}]}]}
+            }
+        }))?;
+        let config =
+            serde_yaml_ng::from_str("proxy-groups:\n- {name: Group A, use: [A]}\n- {name: Group B, use: [B]}\n")?;
+
+        let view = ProxyViewBuilder::build(ProxyViewInput::from_runtime_config(
+            Some(&config),
+            proxies,
+            Some(providers),
+        ));
+        let group_delays = HashMap::new();
+        let delays: Vec<_> = view
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|member| tray_member_delay(member, &view, &group_delays))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            delays,
+            [
+                vec![("Local", Some(23)), ("Shared", Some(81)), ("Missing", None)],
+                vec![("Shared", Some(137))],
+            ]
+        );
+        Ok(())
+    }
 }

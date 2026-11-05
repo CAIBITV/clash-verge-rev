@@ -5,8 +5,13 @@ vi.mock('tauri-plugin-mihomo-api', () => ({
   healthcheckNodeInProvider: vi.fn(async () => ({ delay: 120 })),
 }))
 
+vi.mock('./cmds', () => ({
+  syncTrayProxySelection: vi.fn(async () => undefined),
+}))
+
 import type { ResolvedProxyMember } from '@/types/proxy-view'
 
+import { syncTrayProxySelection } from './cmds'
 import delayManager from './delay'
 
 const node = (name: string) =>
@@ -28,6 +33,7 @@ let unsubscribe: () => void
 
 beforeEach(() => {
   settles = 0
+  vi.mocked(syncTrayProxySelection).mockClear()
   unsubscribe = delayManager.addGroupListener('g', () => {
     settles += 1
   })
@@ -43,6 +49,7 @@ describe('group delay completion', () => {
     await flush()
 
     expect(settles).toBe(1)
+    expect(syncTrayProxySelection).toHaveBeenCalledTimes(1)
   })
 
   test('notifies only listeners for the completed group', async () => {
@@ -55,6 +62,7 @@ describe('group delay completion', () => {
     await flush()
 
     expect(settles).toBe(1)
+    expect(syncTrayProxySelection).toHaveBeenCalledTimes(1)
     expect(other).toBe(0)
     stop()
   })

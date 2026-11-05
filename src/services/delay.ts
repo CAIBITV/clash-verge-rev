@@ -14,6 +14,8 @@ import { debugLog } from '@/utils/debug'
 import { classifyDelay, DEFAULT_DELAY_TIMEOUT } from '@/utils/delay'
 import { isValidUrl } from '@/utils/network'
 
+import { syncTrayProxySelection } from './cmds'
+
 export type DelaySnapshot = {
   of: (member: ResolvedProxyMember) => number
 }
@@ -100,6 +102,9 @@ class DelayManager {
       const groups = this.pendingGroupUpdates
       this.pendingGroupUpdates = new Set()
 
+      void syncTrayProxySelection().catch((error) => {
+        console.error('[DelayManager] 托盘延迟同步失败', error)
+      })
       groups.forEach((group) => {
         const listeners = this.groupListenerMap.get(group)
         if (!listeners) return

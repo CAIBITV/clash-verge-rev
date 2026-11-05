@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::Serialize;
+use serde_yaml_ng::Mapping;
 use tauri_plugin_mihomo::models::{
     DelayHistory, Proxies, Proxy, ProxyProvider, ProxyProviders, ProxyType, VehicleType,
 };
@@ -10,6 +11,86 @@ pub struct ProxyViewInput {
     pub group_scopes: BTreeMap<String, GroupScope>,
     pub proxies: Proxies,
     pub providers: Option<ProxyProviders>,
+}
+
+impl ProxyViewInput {
+    pub fn from_runtime_config(config: Option<&Mapping>, proxies: Proxies, providers: Option<ProxyProviders>) -> Self {
+        Self {
+            runtime_group_order: runtime_group_order(config),
+            group_scopes: runtime_group_scopes(config),
+            proxies,
+            providers,
+        }
+    }
+}
+
+fn runtime_group_order(config: Option<&Mapping>) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    config
+        .and_then(|config| config.get("proxy-groups"))
+        .and_then(|groups| groups.as_sequence())
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("name"))
+        .filter_map(|name| name.as_str())
+        .filter(|name| !name.is_empty() && *name != "GLOBAL")
+        .filter(|name| seen.insert(*name))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Mirrors Mihomo: `include-all`/`include-all-providers` replace `use` with every provider, sorted.
+fn runtime_group_scopes(config: Option<&Mapping>) -> BTreeMap<String, GroupScope> {
+    let Some(config) = config else {
+        return BTreeMap::new();
+    };
+    let mut all_providers = config
+        .get("proxy-providers")
+        .and_then(|providers| providers.as_mapping())
+        .into_iter()
+        .flat_map(|providers| providers.keys())
+        .filter_map(|name| name.as_str())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    all_providers.sort();
+    let flag = |group: &Mapping, key: &str| group.get(key).and_then(|value| value.as_bool()) == Some(true);
+
+    config
+        .get("proxy-groups")
+        .and_then(|groups| groups.as_sequence())
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.as_mapping())
+        .filter_map(|group| {
+            let name = group.get("name")?.as_str()?.to_owned();
+            let providers = if flag(group, "include-all") || flag(group, "include-all-providers") {
+                all_providers.clone()
+            } else {
+                group
+                    .get("use")
+                    .and_then(|providers| providers.as_sequence())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|provider| provider.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            };
+            let exclude_types = group
+                .get("exclude-type")
+                .and_then(|types| types.as_str())
+                .filter(|types| !types.is_empty())
+                .map(|types| types.split('|').map(str::to_owned).collect())
+                .unwrap_or_default();
+            Some((
+                name,
+                GroupScope {
+                    providers,
+                    exclude_types,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The providers a group draws from (Mihomo order) and its `exclude-type` entries.

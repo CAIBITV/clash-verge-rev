@@ -1,6 +1,6 @@
 use crate::config::{IProfilePreview, IVerge};
 use crate::core::lightweight;
-use crate::core::proxy_view::{ProxyMemberRef, ProxyViewBuilder, ProxyViewInput, ProxyViewV1};
+use crate::core::proxy_view::{ProxyGroupView, ProxyMemberRef, ProxyViewBuilder, ProxyViewInput, ProxyViewV1};
 use crate::core::tray::menu_def::TrayAction;
 use crate::process::AsyncHandler;
 use crate::singleton;
@@ -15,6 +15,7 @@ use crate::{
 use clash_verge_limiter::{Limiter, SystemClock, SystemLimiter};
 use clash_verge_logging::logging_error;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_mihomo::models::DelayHistory;
 use tokio::fs;
 
 use super::handle;
@@ -456,33 +457,61 @@ fn create_profile_menu_item(
         .collect()
 }
 
-fn tray_member_delay<'a>(
-    member: &'a ProxyMemberRef,
-    view: &ProxyViewV1,
-    group_delays: &HashMap<&str, u16>,
-) -> (&'a str, Option<u16>) {
+const TRAY_GROUP_DEPTH_LIMIT: usize = 8;
+
+const fn member_name(member: &ProxyMemberRef) -> &str {
     match member {
-        ProxyMemberRef::Group { name } => (name, group_delays.get(name.as_str()).copied()),
-        ProxyMemberRef::Node { name, record_id } => {
-            let delay = view
-                .records
-                .get(record_id)
-                .and_then(|node| node.history.last())
-                .map(|history| history.delay);
-            (name, delay)
+        ProxyMemberRef::Node { name, .. }
+        | ProxyMemberRef::Group { name }
+        | ProxyMemberRef::Unresolved { name, .. } => name.as_str(),
+    }
+}
+
+fn last_delay(history: &[DelayHistory]) -> Option<u16> {
+    history.last().map(|history| history.delay)
+}
+
+/// Prefers the group's own history, as the dashboard does; the core rarely writes one for
+/// selector groups, so the chain of selected members is followed down to a node otherwise.
+fn group_delay(groups: &HashMap<&str, &ProxyGroupView>, view: &ProxyViewV1, name: &str) -> Option<u16> {
+    let mut group = *groups.get(name)?;
+    if let Some(delay) = last_delay(&group.history) {
+        return Some(delay);
+    }
+    for _ in 0..TRAY_GROUP_DEPTH_LIMIT {
+        let now = group.now.as_deref()?;
+        match group.members.iter().find(|member| member_name(member) == now)? {
+            ProxyMemberRef::Node { record_id, .. } => return last_delay(&view.records.get(record_id)?.history),
+            ProxyMemberRef::Group { name } => group = groups.get(name.as_str())?,
+            ProxyMemberRef::Unresolved { .. } => return None,
         }
-        ProxyMemberRef::Unresolved { name, .. } => (name, None),
+    }
+    None
+}
+
+fn tray_member_delay(
+    member: &ProxyMemberRef,
+    view: &ProxyViewV1,
+    groups: &HashMap<&str, &ProxyGroupView>,
+) -> Option<u16> {
+    match member {
+        ProxyMemberRef::Group { name } => group_delay(groups, view, name),
+        ProxyMemberRef::Node { record_id, .. } => last_delay(&view.records.get(record_id)?.history),
+        ProxyMemberRef::Unresolved { .. } => None,
     }
 }
 
 fn create_proxy_submenus(app_handle: &AppHandle, proxy_mode: &str, view: &ProxyViewV1) -> Vec<Submenu<Wry>> {
-    let groups = view.groups.iter().chain(view.global.iter());
-    let group_delays = groups
-        .clone()
-        .filter_map(|group| Some((group.name.as_str(), group.history.last()?.delay)))
+    let groups = view
+        .groups
+        .iter()
+        .chain(view.global.iter())
+        .map(|group| (group.name.as_str(), group))
         .collect::<HashMap<_, _>>();
 
-    groups
+    view.groups
+        .iter()
+        .chain(view.global.iter())
         .filter(|group| (proxy_mode == "global") == (group.name == "GLOBAL") && !group.hidden.unwrap_or_default())
         .filter_map(|group| {
             let group_name = &group.name;
@@ -491,7 +520,8 @@ fn create_proxy_submenus(app_handle: &AppHandle, proxy_mode: &str, view: &ProxyV
                 .members
                 .iter()
                 .filter_map(|member| {
-                    let (name, delay) = tray_member_delay(member, view, &group_delays);
+                    let name = member_name(member);
+                    let delay = tray_member_delay(member, view, &groups);
                     let delay_text = match delay {
                         Some(delay @ 1..=9999) => format!("{delay}ms"),
                         _ => "-ms".to_owned(),
@@ -592,9 +622,11 @@ async fn create_tray_menu(
         let runtime = Config::runtime().await.latest_arc();
         proxies.ok().and_then(Result::ok).map(|proxies| {
             let providers = providers.ok().and_then(Result::ok);
-            let mut input = ProxyViewInput::from_runtime_config(runtime.config.as_ref(), proxies, providers);
-            input.runtime_group_order.extend(input.proxies.proxies.keys().cloned());
-            ProxyViewBuilder::build(input)
+            ProxyViewBuilder::build(ProxyViewInput::from_runtime_config(
+                runtime.config.as_ref(),
+                proxies,
+                providers,
+            ))
         })
     } else {
         None
@@ -986,12 +1018,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tray_uses_the_delay_from_the_groups_provider() -> anyhow::Result<()> {
+    fn tray_member_delays_follow_dashboard_sources() -> anyhow::Result<()> {
         let proxies = serde_json::from_value(json!({
             "proxies": {
                 "Local": {"history": [{"delay": 23}]},
                 "Group A": {"all": ["Local", "Shared", "Missing"]},
-                "Group B": {"all": ["Shared"]}
+                "Group B": {"all": ["Shared"], "now": "Shared"},
+                "Tested": {"all": ["Local"], "now": "Local", "history": [{"delay": 5}]},
+                "Outer": {"all": ["Group B", "Tested"], "now": "Group B"}
             }
         }))?;
         let providers = serde_json::from_value(json!({
@@ -1000,15 +1034,20 @@ mod tests {
                 "B": {"vehicleType": "File", "proxies": [{"name": "Shared", "history": [{"delay": 137}]}]}
             }
         }))?;
-        let config =
-            serde_yaml_ng::from_str("proxy-groups:\n- {name: Group A, use: [A]}\n- {name: Group B, use: [B]}\n")?;
+        let config = serde_yaml_ng::from_str(
+            "proxy-groups:\n- {name: Group A, use: [A]}\n- {name: Group B, use: [B]}\n- {name: Tested}\n- {name: Outer}\n",
+        )?;
 
         let view = ProxyViewBuilder::build(ProxyViewInput::from_runtime_config(
             Some(&config),
             proxies,
             Some(providers),
         ));
-        let group_delays = HashMap::new();
+        let groups = view
+            .groups
+            .iter()
+            .map(|group| (group.name.as_str(), group))
+            .collect::<HashMap<_, _>>();
         let delays: Vec<_> = view
             .groups
             .iter()
@@ -1016,7 +1055,7 @@ mod tests {
                 group
                     .members
                     .iter()
-                    .map(|member| tray_member_delay(member, &view, &group_delays))
+                    .map(|member| (member_name(member), tray_member_delay(member, &view, &groups)))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1026,6 +1065,8 @@ mod tests {
             [
                 vec![("Local", Some(23)), ("Shared", Some(81)), ("Missing", None)],
                 vec![("Shared", Some(137))],
+                vec![("Local", Some(23))],
+                vec![("Group B", Some(137)), ("Tested", Some(5))],
             ]
         );
         Ok(())
